@@ -14,11 +14,12 @@ os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(
     qt_plugin_dir, "platforms"
 )
 
-from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout
-
-from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout
+from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QVBoxLayout, 
+                             QHBoxLayout, QFormLayout, QComboBox, 
+                             QDoubleSpinBox, QFileDialog, QGroupBox)
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont, QPixmap
+
 
 # ==========================================
 # 1. 기존의 Origin 데이터 처리 함수들 (그대로 유지)
@@ -201,7 +202,112 @@ def read_lsv(file, original_fname, rs):
     return df
 
 
-def process_mpt_final():
+def process_mpt_final(target_folder, current_ref, ph_value, electrode_area, save_path):
+    if not os.path.isdir(target_folder):
+        raise FileNotFoundError(f"폴더가 없습니다: {target_folder}")
+    if electrode_area <= 0:
+        raise ValueError("전극 면적은 0보다 커야 합니다.")
+
+    # 1. UI에서 받아온 변수들로 RHE Shift 계산!
+    rhe_shift = REF_DICT[current_ref] + 0.059 * ph_value
+    
+    # 🚨 [여기서 원래 os.path.join 하던 부분은 뺐어! save_path를 통째로 받아왔으니까!] 🚨
+
+    # 2. mpt 파일들 긁어오기
+    mpt_files = sorted(glob.glob(os.path.join(target_folder, "*.mpt")))
+    if not mpt_files:
+        print("mpt 파일을 찾을 수 없습니다.")
+        return
+
+    lsv_groups = defaultdict(list)
+    nyquist_files = []
+    for file in mpt_files:
+        fname = os.path.splitext(os.path.basename(file))[0]
+        nyquist_match = re.fullmatch(r"(.+)_N", fname, flags=re.IGNORECASE)
+        if nyquist_match:
+            nyquist_files.append((nyquist_match.group(1), file, fname))
+            continue
+
+        scan_match = re.fullmatch(r"(.+)_(\d+)", fname)
+        if scan_match:
+            base_name = scan_match.group(1)
+            scan_num = int(scan_match.group(2))
+        else:
+            base_name = fname
+            scan_num = 0
+        lsv_groups[base_name].append((scan_num, file, fname))
+
+    rs_by_group = {}
+    nyquist_data = []
+    for base_name, file, fname in nyquist_files:
+        group_key = base_name.casefold()
+        if group_key in rs_by_group:
+            raise ValueError(f"같은 그룹의 Nyquist가 중복됩니다: {base_name}")
+        try:
+            df_nyquist = read_nyquist(file, fname)
+            rs = extract_rs(df_nyquist)
+        except Exception as e:
+            raise RuntimeError(f"Nyquist의 Rs 계산 실패: {fname}") from e
+
+        rs_by_group[group_key] = rs
+        nyquist_data.append((base_name, fname, df_nyquist))
+        print(f"✅ {fname}: Rs = {rs:.6g} Ω")
+
+    connect_origin()
+    try:
+        op.new()
+        default_book = op.find_book()
+        if default_book:
+            default_book.destroy()
+
+        created_sheets = 0
+        failed_files = []
+
+        for base_name, files_info in lsv_groups.items():
+            sheet_name = f"LSV_{base_name}"
+            group_key = base_name.casefold()
+            rs = rs_by_group.get(group_key, 0.0)
+            print(f"\n➡ 처리 중: {sheet_name}; Rs = {rs:.6g} Ω")
+
+            scans = []
+            for scan_num, file, fname in sorted(files_info, key=lambda item: item[0]):
+                try:
+                    # 🚨 여기서 UI에서 훔쳐온 rhe_shift, electrode_area, current_ref를 넣어주는 거야!
+                    df_scan = read_lsv(file, fname, rs, rhe_shift, electrode_area, current_ref)
+                    scans.append(df_scan)
+                    print(f"  읽기 완료: {fname} ({len(df_scan)}행)")
+                except Exception as e:
+                    failed_files.append(fname)
+                    print(f"  [읽기 실패] {fname}: {e}")
+
+            if not scans:
+                print("  [건너뜀] 유효한 스캔이 없습니다.")
+                continue
+
+            create_sheet(pd.concat(scans, axis=1), sheet_name, pattern="XXYYYXY")
+            created_sheets += 1
+
+        for base_name, fname, df_nyquist in nyquist_data:
+            sheet_name = f"Nyquist_{base_name}"
+            print(f"\n➡ 처리 중: {sheet_name}")
+            create_sheet(df_nyquist, sheet_name, pattern="XY")
+            created_sheets += 1
+
+        if created_sheets == 0:
+            print("\n저장할 데이터가 없습니다.")
+            return
+
+        # 🚨 [제일 중요한 부분] UI 탐색기에서 네가 찝어준 경로(save_path)에다 바로 저장!!
+        op.save(save_path)
+        print(f"\n✅ {created_sheets}개 시트 저장 완료!\n파일: {save_path}")
+        if failed_files:
+            print("\n읽기 실패로 제외된 파일:\n" + "\n".join(failed_files))
+    finally:
+        try:
+            op.exit()
+            print("Origin 종료 완료")
+        except Exception as close_error:
+            print(f"Origin 종료 요청 실패: {close_error}")
     if not os.path.isdir(target_folder):
         raise FileNotFoundError(f"폴더가 없습니다: {target_folder}")
     if ELECTRODE_AREA <= 0:
@@ -318,6 +424,11 @@ def process_mpt_final(target_folder, current_ref="Ag/AgCl (3.5M KCl)", ph_value=
 # ==========================================
 # 2. GUI (캐릭터 창) 구현 부분
 # ==========================================
+
+def resource_path(relative_path):
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
+
 class DragDropApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -326,7 +437,7 @@ class DragDropApp(QWidget):
     def initUI(self):
         # 드래그 앤 드롭 허용
         self.setAcceptDrops(True)
-        self.setWindowTitle("LSV Origin 자동 변환기")
+        self.setWindowTitle("LSV Origin 자동 변환기 - 모몽가 에디션")
         self.resize(600, 650)
         self.setStyleSheet("background-color: white;")
 
@@ -336,18 +447,15 @@ class DragDropApp(QWidget):
         self.char_label = QLabel(self)
         self.char_label.setAlignment(Qt.AlignCenter)
         
-        # [중요] 실제 캐릭터 이미지가 있다면 아래 주석을 풀고 파일 이름을 적어주세요.
-        pixmap = QPixmap("momonga.jpg")
+        # [중요] 모몽가 이미지 로드
+        image_path = resource_path("momonga.jpg") # exe 파일 포함을 위한 resource_path 사용 가정
+        pixmap = QPixmap(image_path)
         self.char_label.setPixmap(
-            pixmap.scaled(280, 320, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            pixmap.scaled(500, 550, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         )
-        
-        # 이미지가 없을 때를 위한 임시 텍스트 아이콘
-        #self.char_label.setText("👩‍🔬") 
-        #self.char_label.setFont(QFont("Arial", 60))
 
         # 2. 안내 대사 (말풍선 느낌)
-        self.text_label = QLabel("내놔!", self)
+        self.text_label = QLabel("앙? 빨리 데이터가 든 폴더나 바치란 말이야!\n확 물어버린다!", self)
         self.text_label.setAlignment(Qt.AlignCenter)
         self.text_label.setWordWrap(True)
         self.text_label.setFont(QFont("Malgun Gothic", 18, QFont.Bold))
@@ -361,14 +469,14 @@ class DragDropApp(QWidget):
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.accept()
-            self.text_label.setText("마우스를 놔!")
-            self.setStyleSheet("background-color: #e0f7fa;") # 배경색 살짝 변경
+            self.text_label.setText("그래, 그거! 당장 거기서 마우스 떼라고!!")
+            self.setStyleSheet("background-color: #ffe4e1;") # 약간 붉은/핑크빛 분노(?) 배경으로 변경
         else:
             event.ignore()
 
     # 창 밖으로 나갈 때 (취소)
     def dragLeaveEvent(self, event):
-        self.text_label.setText("내놔")
+        self.text_label.setText("아앙?! 감히 줬다 뺐어?! 당장 안 가져와?!")
         self.setStyleSheet("background-color: white;")
 
     # 드롭했을 때 (마우스를 놓았을 때)
@@ -379,17 +487,16 @@ class DragDropApp(QWidget):
             folder_path = urls[0].toLocalFile()
             
             if not os.path.isdir(folder_path):
-                self.text_label.setText("앗, 이건 폴더가 아닌 것 같아!\n'폴더'를 드래그 해줘.")
+                self.text_label.setText("장난해?! 이건 폴더가 아니잖아!\n눈은 장식이야?! 똑바로 안 가져와?!")
                 return
 
             # UI 화면 갱신 (처리 중 메시지 띄우기)
-            self.text_label.setText(f"열심히 처리 중이야...\nOrigin이 켜질 때까지 잠시만 기다려줘!\n\n경로: {folder_path}")
-            self.char_label.setText("⏳")
+            self.text_label.setText(f"아~ 진짜 귀찮게 하네!\n내가 특별히 해주는 거니까 Origin 켜질 때까지 얌전히 기다려!\n\n경로: {folder_path}")
+            # self.char_label.setText("⏳")  # <-- 이걸 쓰면 모몽가 이미지가 사라지므로 주석 처리!
             QApplication.processEvents() 
 
             try:
                 # 여기서 Origin 처리 함수 실행!
-                # (pH나 전극 면적 등을 고정값으로 두거나, 필요한 경우 UI 입력칸을 추가할 수 있습니다)
                 process_mpt_final(
                     target_folder=folder_path,
                     current_ref="Ag/AgCl (3.5M KCl)",
@@ -397,11 +504,11 @@ class DragDropApp(QWidget):
                     electrode_area=0.5,
                     output_name="LSV_Origin_Modified.opju"
                 )
-                self.char_label.setText("✨")
-                self.text_label.setText("짜잔! 완료됐어!\nOrigin 프로그램을 확인해봐.")
+                # self.char_label.setText("✨") # <-- 마찬가지로 주석 처리
+                self.text_label.setText("흥! 다 끝났으니까 알아서 확인해!\n이 몸의 은혜에 감사하라고!")
             except Exception as e:
-                self.char_label.setText("💦")
-                self.text_label.setText(f"에러가 발생했어 ㅠㅠ:\n{e}")
+                # self.char_label.setText("💦") # <-- 주석 처리
+                self.text_label.setText(f"아악! 네가 이상한 걸 줘서 에러 났잖아!! 어떻게 할 거야!!\n\n{e}")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
