@@ -21,7 +21,7 @@ os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = os.path.join(
 # PyQt5 모듈들 
 from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout,
                              QFormLayout, QComboBox, QDoubleSpinBox, 
-                             QFileDialog, QGroupBox)
+                             QFileDialog, QGroupBox, QMessageBox, QPushButton)
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont, QPixmap
 
@@ -47,9 +47,10 @@ def connect_origin():
         if is_rpc_error and opc.oext and "_app" in vars(opc.po):
             opc.po._app = None
         try:
-            op.set_show(False)
+            op.set_show(True)
         except Exception as start_error:
             raise RuntimeError("Origin에 연결할 수 없습니다. Origin을 실행한 뒤 다시 시도하세요.") from start_error
+    op.set_show(True)
     print("Origin 연결 완료")
 
 def force_xy_designations(wks, pattern):
@@ -148,8 +149,9 @@ def process_mpt_final(target_folder, current_ref, ph_value, electrode_area, save
 
     mpt_files = sorted(glob.glob(os.path.join(target_folder, "*.mpt")))
     if not mpt_files:
-        print("mpt 파일을 찾을 수 없습니다.")
-        return
+        raise FileNotFoundError(
+            f"선택한 폴더의 최상위에서 .mpt 파일을 찾지 못했습니다:\n{target_folder}"
+        )
 
     lsv_groups = defaultdict(list)
     nyquist_files = []
@@ -184,6 +186,7 @@ def process_mpt_final(target_folder, current_ref, ph_value, electrode_area, save
         print(f"✅ {fname}: Rs = {rs:.6g} Ω")
 
     connect_origin()
+    save_completed = False
     try:
         op.new()
         default_book = op.find_book()
@@ -205,7 +208,7 @@ def process_mpt_final(target_folder, current_ref, ph_value, electrode_area, save
                     df_scan = read_lsv(file, fname, rs, rhe_shift, electrode_area, current_ref)
                     scans.append(df_scan)
                 except Exception as e:
-                    failed_files.append(fname)
+                    failed_files.append(f"{fname}: {e}")
 
             if not scans:
                 continue
@@ -219,16 +222,29 @@ def process_mpt_final(target_folder, current_ref, ph_value, electrode_area, save
             created_sheets += 1
 
         if created_sheets == 0:
-            print("\n저장할 데이터가 없습니다.")
-            return
+            details = "\n".join(failed_files)
+            message = "변환 가능한 데이터가 없어 파일을 저장하지 않았습니다."
+            if details:
+                message += f"\n\n실패한 파일:\n{details}"
+            raise RuntimeError(message)
 
-        op.save(save_path)
+        if not op.save(save_path):
+            raise RuntimeError(
+                "Origin이 프로젝트 저장에 실패했다고 응답했습니다.\n"
+                "Origin 창에 추가 오류나 확인 대화상자가 표시되는지 확인하세요.\n"
+                f"저장 경로: {save_path}"
+            )
+        if not os.path.isfile(save_path):
+            raise RuntimeError(f"Origin 저장 후 파일을 찾을 수 없습니다:\n{save_path}")
+        save_completed = True
         print(f"\n✅ {created_sheets}개 시트 저장 완료!\n파일: {save_path}")
+        return created_sheets, failed_files
     finally:
-        try:
-            op.exit()
-        except Exception:
-            pass
+        if save_completed:
+            try:
+                op.exit()
+            except Exception as close_error:
+                print(f"Origin 종료 요청 실패: {close_error}")
 
 
 class DragDropApp(QWidget):
@@ -266,7 +282,7 @@ class DragDropApp(QWidget):
                 )
             )
 
-        self.text_label = QLabel("앙? 옆에 값 똑바로 맞추고 폴더나 던져!\n확 물어버리기 전에!", self)
+        self.text_label = QLabel("앙? 옆에 값 똑바로 맞추고 빨리 폴더나 바쳐!\n꾸물거리면 확 물어버린다!", self)
         self.text_label.setAlignment(Qt.AlignCenter)
         self.text_label.setWordWrap(True)
         self.text_label.setFont(QFont("Malgun Gothic", 13, QFont.Bold))
@@ -331,11 +347,16 @@ class DragDropApp(QWidget):
         drop_hint.setWordWrap(True)
         drop_hint.setAlignment(Qt.AlignCenter)
         drop_hint.setStyleSheet("color: #777777; padding: 20px;")
-        
+
+        self.select_folder_button = QPushButton("버튼 눌러서 폴더 바치기")
+        self.select_folder_button.setMinimumHeight(42)
+        self.select_folder_button.clicked.connect(self.select_folder)
+
         # 🚨 [가장 중요한 부분] 위아래로 투명 스프링(Stretch)을 넣어서 놈들을 예쁘게 중앙으로 밀어버렸어!
         right_layout.addStretch(1)   # 위에서 밑으로 쫘악 밀어냄!
         right_layout.addWidget(param_group)
         right_layout.addWidget(drop_hint)
+        right_layout.addWidget(self.select_folder_button)
         right_layout.addStretch(1)   # 밑에서 위로 밀어내서 완벽한 센터를 맞춤!
 
         main_layout.addWidget(left_panel, 3)
@@ -345,14 +366,21 @@ class DragDropApp(QWidget):
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.accept()
-            self.text_label.setText("그래, 그거! 당장 거기서 마우스 떼라고!!")
+            self.text_label.setText("오! 그래 그거야! 당장 거기서 마우스 떼라고!!")
             self.setStyleSheet("background-color: #ffe4e1;") 
         else:
             event.ignore()
 
     def dragLeaveEvent(self, event):
-        self.text_label.setText("아앙?! 감히 줬다 뺐어?! 당장 안 가져와?!")
+        self.text_label.setText("아앙?! 감히 이 몸을 상대로 장난을 쳐?! 당장 다시 안 가져와?!")
         self.setStyleSheet("background-color: white;")
+
+    def select_folder(self):
+        folder_path = QFileDialog.getExistingDirectory(
+            self, "어떤 폴더 바칠 건데?! 빨리 골라!"
+        )
+        if folder_path:
+            self.process_folder(folder_path)
 
     def dropEvent(self, event):
         self.setStyleSheet("background-color: white;")
@@ -361,9 +389,13 @@ class DragDropApp(QWidget):
         
         folder_path = urls[0].toLocalFile()
         if not os.path.isdir(folder_path):
-            self.text_label.setText("장난해?! 이건 폴더가 아니잖아!\n눈은 장식이야?! 똑바로 안 가져와?!")
+            self.text_label.setText("아악! 폴더를 내놓으라니까 쓰레기를 던져?!\n눈은 장식이야?! 똑바로 가져와!")
+            QMessageBox.warning(self, "아악!!", "장난해?! 폴더(Folder)를 통째로 던지라고!!")
             return
 
+        self.process_folder(folder_path)
+
+    def process_folder(self, folder_path):
         selected_ref = self.ref_combo.currentText()
         selected_ph = self.ph_spin.value()
         selected_area = self.area_spin.value()
@@ -376,17 +408,47 @@ class DragDropApp(QWidget):
         )
 
         if not save_path:
-            self.text_label.setText("아앙?! 왜 저장을 취소해! 장난치는 거야?!\n처음부터 다시 던져!!")
+            self.text_label.setText("아앙?! 왜 저장을 취소해! 기껏 일할 맘이 생겼는데 초 치지 마!\n처음부터 다시 던져!!")
             return
 
-        self.text_label.setText("흥! 열심히 일하는 중이니까 얌전히 기다려!!\n(Origin이 백그라운드에서 켜집니다)")
+        # [경로 기호 변환 및 확장자 고정 (Origin 저장 에러 방지)]
+        save_path = os.path.normpath(save_path) 
+        if not save_path.lower().endswith('.opju'):
+            save_path += '.opju'
+
+        self.text_label.setText("흥! 이 몸이 특별히 일해주고 있으니까 끝날 때까지 얌전히 숨 쉬고 기다려!!\n(Origin 작업 중...)")
         QApplication.processEvents() 
 
         try:
-            process_mpt_final(target_folder=folder_path, current_ref=selected_ref, ph_value=selected_ph, electrode_area=selected_area, save_path=save_path)
-            self.text_label.setText(f"흥! 다 끝났으니까 알아서 확인해!\n이 몸의 은혜에 감사하라고!\n저장됨: {os.path.basename(save_path)}")
+            created_sheets, failed_files = process_mpt_final(
+                target_folder=folder_path,
+                current_ref=selected_ref,
+                ph_value=selected_ph,
+                electrode_area=selected_area,
+                save_path=save_path,
+            )
+            if failed_files:
+                details = "\n".join(failed_files[:8])
+                if len(failed_files) > 8:
+                    details += f"\n외 {len(failed_files) - 8}개 찌꺼기들"
+                self.text_label.setText(
+                    f"짜잔-! {created_sheets}개는 해줬다!\n근데 몇 개는 네가 이상한 걸 줘서 실패했어!"
+                )
+                QMessageBox.warning(
+                    self, "야! 몇 개 실패했어!", 
+                    f"네가 준 파일이 이상해서 튕겼잖아! {created_sheets}개는 살려줬으니까 고마워하라고!\n\n저장 위치:\n{save_path}\n\n[실패 목록]\n{details}"
+                )
+            else:
+                self.text_label.setText(
+                    f"짜잔-! 다 끝났어! 완벽하지?!\n{created_sheets}개나 처리해 줬으니까 얼른 엎드려서 감사하라고!"
+                )
+                QMessageBox.information(
+                    self, "당장 칭찬해!!", 
+                    f"완벽하게 끝냈어! {created_sheets}개 시트나 만들어줬으니까 귀여운 나를 어서 칭찬해!\n\n저장 완료:\n{save_path}"
+                )
         except Exception as e:
-            self.text_label.setText(f"아악! 네가 이상한 걸 줘서 에러 났잖아!!\n\n{e}")
+            self.text_label.setText("꺄아악!! 네가 이상한 걸 줘서 에러가 났잖아!! 내 탓 아니야!\n당장 팝업 에러나 똑바로 읽어봐!!")
+            QMessageBox.critical(self, "꺄아악!!", f"이상한 짓 해서 에러 났잖아!! 어떻게 할 거야!!\n\n상세 내용:\n{str(e)}")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
